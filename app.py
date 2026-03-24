@@ -1,10 +1,14 @@
 import json
+import threading
 from pathlib import Path
 
+import av
+import cv2
 import numpy as np
 import streamlit as st
 import tensorflow as tf
 from PIL import Image
+from streamlit_webrtc import VideoProcessorBase, webrtc_streamer
 
 DEFAULT_MODEL_PATH = Path("models/mobilenetv2_binary_run/best.keras")
 DEFAULT_LABELS_PATH = Path("models/mobilenetv2_binary_run/labels.json")
@@ -54,10 +58,85 @@ def preprocess_image(image: Image.Image, image_size: int) -> np.ndarray:
     return arr
 
 
+class FAWVideoProcessor(VideoProcessorBase):
+
+    def __init__(self):
+        self.model = None
+        self.labels = []
+        self.infected_idx = None
+        self.image_size = DEFAULT_IMAGE_SIZE
+        self.threshold = 0.35
+        self.frame_count = 0
+        self.lock = threading.Lock()
+        self.last_label = ""
+        self.last_confidence = 0.0
+        self.last_is_infected = False
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+
+        self.frame_count += 1
+        # Process every 3rd frame to reduce CPU load
+        if self.frame_count % 3 == 0 and self.model is not None:
+            pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            batch = preprocess_image(pil_img, self.image_size)
+
+            with self.lock:
+                probs = self.model.predict(batch, verbose=0)[0]
+
+            labels = self.labels if self.labels else [
+                f"Class_{i}" for i in range(len(probs))
+            ]
+
+            if (
+                self.infected_idx is not None
+                and float(probs[self.infected_idx]) >= self.threshold
+            ):
+                best_idx = self.infected_idx
+            else:
+                best_idx = int(np.argmax(probs))
+
+            self.last_label = labels[best_idx]
+            self.last_confidence = float(probs[best_idx])
+            self.last_is_infected = self.last_label == "infected"
+
+        # Draw overlay on every frame (using last prediction)
+        if self.last_label:
+            label_text = f"{self.last_label.upper()} ({self.last_confidence * 100:.1f}%)"
+
+            if self.last_is_infected:
+                color = (0, 0, 255)  # Red in BGR
+                bg_color = (0, 0, 180)
+            else:
+                color = (0, 200, 0)  # Green in BGR
+                bg_color = (0, 140, 0)
+
+            h, w = img.shape[:2]
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 1.0
+            thickness = 2
+            (text_w, text_h), baseline = cv2.getTextSize(
+                label_text, font, font_scale, thickness
+            )
+
+            # Draw background rectangle at top
+            cv2.rectangle(img, (0, 0), (text_w + 20, text_h + baseline + 20), bg_color, -1)
+            # Draw text
+            cv2.putText(
+                img, label_text, (10, text_h + 10),
+                font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA,
+            )
+
+            # Draw border around frame
+            cv2.rectangle(img, (0, 0), (w - 1, h - 1), color, 3)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
 def main():
     st.set_page_config(page_title="FAW Detector", page_icon="🌽", layout="centered")
     st.title("Fall Army Worm Detection")
-    st.write("Upload a corn leaf image to check for worm infection.")
+    st.write("Point your camera at a corn leaf for real-time infection detection.")
 
     # Sidebar: model config
     with st.sidebar:
@@ -86,47 +165,27 @@ def main():
         with st.sidebar:
             st.write(f"**Classes:** {', '.join(labels)}")
 
-    # Find infected class index
     infected_idx = None
     if "infected" in labels:
         infected_idx = labels.index("infected")
 
-    # Upload
-    uploaded = st.file_uploader("Upload crop image", type=["jpg", "jpeg", "png", "bmp", "webp"])
+    # Real-time camera detection
+    ctx = webrtc_streamer(
+        key="faw-detector",
+        video_processor_factory=FAWVideoProcessor,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 
-    if uploaded is not None:
-        image = Image.open(uploaded)
-        st.image(image, caption="Uploaded image", use_container_width=True)
+    # Pass model and settings to the video processor
+    if ctx.video_processor:
+        ctx.video_processor.model = model
+        ctx.video_processor.labels = labels
+        ctx.video_processor.infected_idx = infected_idx
+        ctx.video_processor.image_size = int(image_size)
+        ctx.video_processor.threshold = infected_threshold
 
-        batch = preprocess_image(image, int(image_size))
-        probs = model.predict(batch, verbose=0)[0]
-
-        if not labels:
-            labels = [f"Class_{i}" for i in range(len(probs))]
-
-        # Threshold-based decision for infected class
-        if infected_idx is not None and float(probs[infected_idx]) >= infected_threshold:
-            best_idx = infected_idx
-        else:
-            best_idx = int(np.argmax(probs))
-
-        predicted_label = labels[best_idx]
-        confidence = float(probs[best_idx])
-
-        # Color-coded result
-        st.subheader("Prediction")
-        if predicted_label == "infected":
-            st.error(f"**INFECTED** (confidence: {confidence * 100:.1f}%)")
-        else:
-            st.success(f"**NON-INFECTED** (confidence: {confidence * 100:.1f}%)")
-
-        # Show all class probabilities
-        if infected_idx is not None:
-            st.write(f"Infected probability: **{float(probs[infected_idx]) * 100:.1f}%**")
-
-        st.subheader("Class Probabilities")
-        for i, label in enumerate(labels):
-            st.progress(float(probs[i]), text=f"{label}: {float(probs[i]) * 100:.2f}%")
+    st.info("Click **START** to begin real-time detection. Allow camera access when prompted.")
 
 
 if __name__ == "__main__":
