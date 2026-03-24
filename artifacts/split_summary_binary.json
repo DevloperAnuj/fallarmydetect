@@ -1,0 +1,14 @@
+{
+  "infected": {
+    "total": 832,
+    "train": 582,
+    "val": 124,
+    "test": 126
+  },
+  "non_infected": {
+    "total": 4188,
+    "train": 2931,
+    "val": 628,
+    "test": 629
+  }
+}

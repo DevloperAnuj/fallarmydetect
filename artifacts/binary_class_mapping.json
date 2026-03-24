@@ -1,0 +1,7 @@
+{
+  "Blight": "non_infected",
+  "Common_Rust": "non_infected",
+  "Gray_Leaf_Spot": "non_infected",
+  "Healthy": "non_infected",
+  "worm": "infected"
+}

@@ -1,0 +1,7 @@
+tensorflow>=2.18.0
+streamlit>=1.40.0
+numpy>=1.26.0
+scikit-learn>=1.5.0
+matplotlib>=3.9.0
+seaborn>=0.13.2
+Pillow>=10.4.0

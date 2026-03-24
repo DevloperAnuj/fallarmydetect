@@ -1,0 +1,32 @@
+{
+  "Blight": {
+    "total": 1146,
+    "train": 802,
+    "val": 171,
+    "test": 173
+  },
+  "Common_Rust": {
+    "total": 1306,
+    "train": 914,
+    "val": 195,
+    "test": 197
+  },
+  "Gray_Leaf_Spot": {
+    "total": 574,
+    "train": 401,
+    "val": 86,
+    "test": 87
+  },
+  "Healthy": {
+    "total": 1162,
+    "train": 813,
+    "val": 174,
+    "test": 175
+  },
+  "worm": {
+    "total": 832,
+    "train": 582,
+    "val": 124,
+    "test": 126
+  }
+}
