@@ -10,4 +10,6 @@ av>=12.0.0
 opencv-python-headless>=4.8.0
 pyngrok>=7.0.0
 cryptography>=42.0.0
+pyserial>=3.5
+
 

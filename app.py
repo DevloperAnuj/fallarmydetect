@@ -1,5 +1,6 @@
 import atexit
 import json
+import queue
 import signal
 import threading
 import time
@@ -13,7 +14,145 @@ import tensorflow as tf
 from PIL import Image
 from streamlit_webrtc import VideoProcessorBase, webrtc_streamer
 
+try:
+    import serial as pyserial
+    from serial.tools import list_ports as serial_list_ports
+except ImportError:
+    pyserial = None
+    serial_list_ports = None
+
+
+def render_pump_status(pump, placeholder):
+    """Render the pump's latest status string into a Streamlit placeholder."""
+    if pump is None:
+        placeholder.empty()
+        return
+    s = pump.status
+    low = s.lower()
+    if "fired" in low:
+        placeholder.warning(f"💧 Bluetooth: {s}")
+    elif "connected" in low:
+        placeholder.success(f"🔵 Bluetooth: {s}")
+    elif "opening" in low or "starting" in low:
+        placeholder.info(f"🔵 Bluetooth: {s}")
+    else:
+        placeholder.error(f"⚠️ Bluetooth: {s}")
+
+
+def list_bluetooth_com_ports(only_bluetooth: bool = True):
+    """Return [(label, device), ...] for COM ports — Bluetooth first."""
+    if serial_list_ports is None:
+        return []
+    ports = list(serial_list_ports.comports())
+    out = []
+    for p in ports:
+        blob = f"{p.description} {p.hwid}".lower()
+        is_bt = "bluetooth" in blob or "bthenum" in blob
+        if only_bluetooth and not is_bt:
+            continue
+        tag = " (BT)" if is_bt else ""
+        label = f"{p.device} — {p.description}{tag}"
+        out.append((label, p.device))
+    return out
+
 from drone_stream import DroneStream
+
+
+class PumpController:
+    """Fires the ESP32 pump over a Bluetooth SPP virtual COM port.
+
+    Protocol matches the ESP32 sketch: single ASCII byte — b'1' pump on,
+    b'0' pump off. The sketch has no auto-off, so this class schedules the
+    b'0' after `duration_ms`. Debounce + cooldown prevent one detection
+    from re-firing repeatedly.
+    """
+
+    def __init__(self, com_port: str, consec_frames: int = 3,
+                 cooldown_s: float = 10.0, duration_ms: int = 5000,
+                 baud: int = 115200):
+        self.com_port = com_port
+        self.baud = baud
+        self.consec_frames = consec_frames
+        self.cooldown_s = cooldown_s
+        self.duration_ms = duration_ms
+        self._infected_run = 0
+        self._last_fire_ts = 0.0
+        self._cmd_queue: queue.Queue = queue.Queue()
+        self._running = True
+        self.status = "starting"
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def observe(self, is_infected: bool) -> bool:
+        """Feed one classification; returns True if a pump fire was triggered."""
+        now = time.time()
+        if not is_infected:
+            self._infected_run = 0
+            return False
+        self._infected_run += 1
+        if self._infected_run < self.consec_frames:
+            return False
+        if now - self._last_fire_ts < self.cooldown_s:
+            return False
+        self._last_fire_ts = now
+        self._infected_run = 0
+        self._cmd_queue.put(("fire", self.duration_ms))
+        return True
+
+    def manual_fire(self, ms: int | None = None):
+        self._cmd_queue.put(("fire", int(ms or self.duration_ms)))
+
+    def manual_off(self):
+        self._cmd_queue.put(("off", 0))
+
+    def stop(self):
+        self._running = False
+        self._cmd_queue.put(("stop", 0))
+
+    def _run_loop(self):
+        if pyserial is None:
+            self.status = "pyserial not installed"
+            return
+
+        while self._running:
+            ser = None
+            try:
+                self.status = f"opening {self.com_port}..."
+                ser = pyserial.Serial(self.com_port, self.baud, timeout=1)
+                self.status = f"connected on {self.com_port}"
+                while self._running:
+                    try:
+                        cmd, arg = self._cmd_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        continue
+                    if cmd == "stop":
+                        break
+                    if cmd == "fire":
+                        ms = max(0, min(60000, int(arg)))
+                        ser.write(b"1")
+                        ser.flush()
+                        self.status = f"fired ({ms} ms)"
+                        # Sketch has no auto-off; schedule the b'0' ourselves.
+                        threading.Timer(
+                            ms / 1000.0,
+                            lambda: self._cmd_queue.put(("off", 0)),
+                        ).start()
+                    elif cmd == "off":
+                        ser.write(b"0")
+                        ser.flush()
+                        self.status = "pump off"
+            except (OSError, Exception) as e:
+                # SerialException inherits from OSError on Windows
+                self.status = f"{type(e).__name__}: {e}; retrying"
+                time.sleep(2)
+            finally:
+                if ser is not None:
+                    try:
+                        ser.close()
+                    except OSError:
+                        pass
+
+        self.status = "stopped"
 
 
 def _cleanup():
@@ -153,6 +292,7 @@ class FAWVideoProcessor(VideoProcessorBase):
         self.last_label = ""
         self.last_confidence = 0.0
         self.last_is_infected = False
+        self.pump = None
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
@@ -168,13 +308,15 @@ class FAWVideoProcessor(VideoProcessorBase):
                         self.labels, self.infected_idx, self.threshold,
                     )
                 )
+            if self.pump is not None:
+                self.pump.observe(self.last_is_infected)
 
         img = draw_overlay(img, self.last_label,
                            self.last_confidence, self.last_is_infected)
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
-def run_ip_camera(model, labels, infected_idx, image_size, threshold, stream_url):
+def run_ip_camera(model, labels, infected_idx, image_size, threshold, stream_url, pump=None):
     """Read frames from an IP camera stream and display with detection overlay."""
     st.info(f"Connecting to: `{stream_url}`")
 
@@ -191,8 +333,10 @@ def run_ip_camera(model, labels, infected_idx, image_size, threshold, stream_url
         return
 
     st.success("Connected! Streaming...")
+    pump_status_area = st.empty()
     frame_placeholder = st.empty()
     stop_btn = st.button("Stop Stream")
+    render_pump_status(pump, pump_status_area)
 
     frame_count = 0
     last_label, last_confidence, last_is_infected = "", 0.0, False
@@ -213,6 +357,11 @@ def run_ip_camera(model, labels, infected_idx, image_size, threshold, stream_url
             last_label, last_confidence, last_is_infected = classify_frame(
                 model, pil_img, image_size, labels, infected_idx, threshold,
             )
+            if pump is not None:
+                pump.observe(last_is_infected)
+
+        if pump is not None and frame_count % 15 == 0:
+            render_pump_status(pump, pump_status_area)
 
         frame = draw_overlay(
             frame, last_label, last_confidence, last_is_infected)
@@ -225,7 +374,7 @@ def run_ip_camera(model, labels, infected_idx, image_size, threshold, stream_url
     cap.release()
 
 
-def run_drone_camera(model, labels, infected_idx, image_size, threshold, drone_ip):
+def run_drone_camera(model, labels, infected_idx, image_size, threshold, drone_ip, pump=None):
     """Read frames from a KY UFO / E58-style drone via UDP and display with detection."""
 
     # Use session state to persist the drone stream across Streamlit reruns
@@ -233,10 +382,12 @@ def run_drone_camera(model, labels, infected_idx, image_size, threshold, drone_i
         st.session_state.drone = None
 
     status_area = st.empty()
+    pump_status_area = st.empty()
     frame_placeholder = st.empty()
     col1, col2 = st.columns(2)
     start_btn = col1.button("Start Stream")
     stop_btn = col2.button("Stop Stream")
+    render_pump_status(pump, pump_status_area)
 
     if stop_btn and st.session_state.drone is not None:
         st.session_state.drone.stop()
@@ -303,6 +454,12 @@ def run_drone_camera(model, labels, infected_idx, image_size, threshold, drone_i
                 last_label, last_confidence, last_is_infected = classify_frame(
                     model, pil_img, image_size, labels, infected_idx, threshold,
                 )
+                if pump is not None:
+                    pump.observe(last_is_infected)
+
+            # Refresh Bluetooth status ~every 15 frames (~0.5 s at 30fps).
+            if pump is not None and frame_count % 15 == 0:
+                render_pump_status(pump, pump_status_area)
 
             frame = draw_overlay(
                 frame, last_label, last_confidence, last_is_infected)
@@ -397,6 +554,93 @@ def main():
                      "(com.cooingdv.kyufo). Video is RTSP on :7070/webcam.",
             )
 
+        st.header("Pump (ESP32 — Bluetooth)")
+        pump_enabled = st.checkbox("Auto-fire pump on detection", value=False)
+
+        only_bt = st.checkbox("Show only Bluetooth ports", value=True,
+                              disabled=not pump_enabled)
+        ports = list_bluetooth_com_ports(only_bluetooth=only_bt)
+
+        cols = st.columns([3, 1])
+        if cols[1].button("🔄", help="Rescan COM ports",
+                          disabled=not pump_enabled):
+            st.rerun()
+
+        if ports:
+            labels = [label for label, _ in ports]
+            devices = [dev for _, dev in ports]
+            prev = st.session_state.get("pump_port_selection")
+            idx = devices.index(prev) if prev in devices else 0
+            selected_label = cols[0].selectbox(
+                "Bluetooth COM port",
+                labels, index=idx,
+                disabled=not pump_enabled,
+                help="Pair the ESP32 (`FAW-Drone`) in Windows Bluetooth "
+                     "settings first. Two ports appear — pick the one "
+                     "tagged **(BT)**. If it fails, try the other.",
+            )
+            com_port = devices[labels.index(selected_label)]
+            st.session_state.pump_port_selection = com_port
+        else:
+            cols[0].warning(
+                "No Bluetooth COM ports detected. "
+                "Pair `FAW-Drone` in Windows Bluetooth settings, then 🔄."
+            )
+            com_port = cols[0].text_input(
+                "COM port (manual)", "COM7",
+                disabled=not pump_enabled,
+                help="Manual entry fallback. Uncheck 'only Bluetooth' above "
+                     "to see all ports.",
+            )
+        pump_duration_ms = st.number_input(
+            "Spray duration (ms)",
+            min_value=200, max_value=60000, value=5000, step=500,
+            disabled=not pump_enabled,
+        )
+        pump_consec = st.number_input(
+            "Consecutive infected frames before firing",
+            min_value=1, max_value=30, value=3, step=1,
+            disabled=not pump_enabled,
+        )
+        pump_cooldown = st.number_input(
+            "Cooldown after firing (s)",
+            min_value=1, max_value=600, value=10, step=1,
+            disabled=not pump_enabled,
+        )
+
+    # --- Pump controller (persistent across Streamlit reruns) ---
+    pump = None
+    if pump_enabled and com_port:
+        prev = st.session_state.get("pump")
+        signature = (com_port, int(pump_consec),
+                     float(pump_cooldown), int(pump_duration_ms))
+        if prev is None or prev._signature != signature:
+            if prev is not None:
+                prev.stop()
+            pump = PumpController(
+                com_port,
+                consec_frames=int(pump_consec),
+                cooldown_s=float(pump_cooldown),
+                duration_ms=int(pump_duration_ms),
+            )
+            pump._signature = signature
+            st.session_state.pump = pump
+        else:
+            pump = prev
+    else:
+        prev = st.session_state.pop("pump", None)
+        if prev is not None:
+            prev.stop()
+
+    if pump is not None:
+        with st.sidebar:
+            st.caption(f"Pump status: `{pump.status}`")
+            c1, c2 = st.columns(2)
+            if c1.button("Test fire"):
+                pump.manual_fire()
+            if c2.button("Stop pump"):
+                pump.manual_off()
+
     model_path = Path(model_path_input)
     labels_path = Path(labels_path_input)
 
@@ -417,6 +661,11 @@ def main():
 
     # --- Camera modes ---
     if camera_source == "Browser Webcam":
+        pump_status_area = st.empty()
+        render_pump_status(pump, pump_status_area)
+        if pump is not None:
+            st.caption("Pump status updates on any sidebar interaction "
+                       "(WebRTC runs async — no tight loop to auto-refresh).")
         ctx = webrtc_streamer(
             key="faw-detector",
             video_processor_factory=FAWVideoProcessor,
@@ -437,6 +686,7 @@ def main():
             ctx.video_processor.infected_idx = infected_idx
             ctx.video_processor.image_size = int(image_size)
             ctx.video_processor.threshold = infected_threshold
+            ctx.video_processor.pump = pump
 
         st.info("Click **START** to begin detection. Allow camera access when prompted.\n\n"
                 "**Mobile?** Open this app on your phone's browser "
@@ -447,6 +697,7 @@ def main():
             run_ip_camera(
                 model, labels, infected_idx,
                 int(image_size), infected_threshold, stream_url,
+                pump=pump,
             )
         else:
             st.warning("Enter a stream URL in the sidebar to start.")
@@ -456,6 +707,7 @@ def main():
             run_drone_camera(
                 model, labels, infected_idx,
                 int(image_size), infected_threshold, drone_ip,
+                pump=pump,
             )
         else:
             st.warning("Enter the drone IP in the sidebar to start.")
